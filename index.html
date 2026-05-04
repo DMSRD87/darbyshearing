@@ -523,7 +523,7 @@ const LS_LAST_RATES='mg_last_rates_'+CONTRACTOR_SLUG;
 const LS_ROLE_TS='mg_role_ts_'+CONTRACTOR_SLUG;
 const LS_DATA_VERSION='mg_data_version_'+CONTRACTOR_SLUG; /* tracks DATA_VERSION for one-time cache wipe */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.5.0'; /* Increment per deploy. Surfaces in admin footer + save_failures logs for diagnostics. */
+const APP_VERSION='v4.5.1'; /* Telemetry-only patch over v4.5.0. Adds detailed setFresh tracing and visibility/load event logging to find why iPhone sessions report fresh load then immediately block saves. NO functional changes — only diagnostic logging. */
 const DATA_VERSION='2026-05-02-cleanup'; /* Bump to force a one-time localStorage cache wipe on next boot. Used to clear stale state across all devices after a deploy that fixes data-corruption bugs. The wipe only happens if the offline queue is empty or successfully flushed first. */
 
 const lsGet=k=>{try{return JSON.parse(localStorage.getItem(k)||'null');}catch{return null;}};
@@ -3587,7 +3587,13 @@ function App(){
   /* isFreshState mirrors isFreshRef but as React state, so UI components can react to changes. */
   const [isFreshState,setIsFreshState]=useState(false);
   /* Helper to update both ref and state in sync */
-  const setFresh=v=>{isFreshRef.current=v;setIsFreshState(v);};
+  const setFresh=(v,why)=>{
+    const prev=isFreshRef.current;
+    isFreshRef.current=v;
+    setIsFreshState(v);
+    /* TELEMETRY v4.5.1: Log every flip with reason. If fresh→stale unexpectedly, this catches it. */
+    try{logSaveFailure('diag_setfresh',(why||'unknown'),'prev='+prev+';new='+v);}catch(e){}
+  };
   /* lastVisibleRef tracks the timestamp of the last time the tab was visible.
      Used by the visibilitychange handler to decide if a long-hidden tab needs a fresh dbLoad on resume. */
   const lastVisibleRef=useRef(Date.now());
@@ -3619,10 +3625,10 @@ function App(){
          trust this state. Save paths gate on isFreshRef and become no-ops until a
          successful Supabase load promotes us to fresh. */
       if(!fromCache){
-        setFresh(true);
+        setFresh(true,'mountLoad_fresh_supabase');
         logSaveFailure('diag_load','mountLoad','fresh_from_supabase;jobs='+j.length);
       }else{
-        setFresh(false);
+        setFresh(false,'mountLoad_from_cache');
         logSaveFailure('diag_load','mountLoad','stale_from_cache;jobs='+j.length+';online='+navigator.onLine);
       }
       setPendingCount((lsGet(LS_QUEUE)||[]).length);
@@ -3646,7 +3652,15 @@ function App(){
         }
         window.location.hash='';
       }
-    }).catch(()=>{setLoading(false);isLoaded.current=true;setFresh(false);});
+    }).catch(err=>{
+      /* TELEMETRY v4.5.1: Capture WHY mountLoad's .then threw. Previously this catch had no log,
+         which meant if anything inside .then synchronously threw AFTER the fresh log already wrote,
+         we'd silently flip isFresh back to false with no diag trail. */
+      try{logSaveFailure('diag_load','mountLoad_catch','err='+(err&&err.message||err&&err.toString&&err.toString()||'unknown'));}catch(e){}
+      setLoading(false);
+      isLoaded.current=true;
+      setFresh(false,'mountLoad_catch');
+    });
 
     /* PATCH v4.5.0: Data version check.
        On boot, compare stored DATA_VERSION against the version this code build expects.
@@ -3762,7 +3776,7 @@ function App(){
           setJobs(migratedJobs);setFarmList(f);setCrewList(c);
           /* PATCH v4.5.0: Promote to fresh if this dbLoad succeeded against Supabase */
           if(!fromCache){
-            setFresh(true);
+            setFresh(true,'goOnline_refetch');
             dirtyRef.current=false; /* state is now fresh from Supabase, not dirty */
             logSaveFailure('diag_load','goOnline_dbLoad','promoted_to_fresh');
           }
@@ -3791,6 +3805,17 @@ function App(){
         stale. Now the effect only fires when jobs actually change. */
   useEffect(()=>{
     if(!isLoaded.current)return;
+    /* TELEMETRY v4.5.1: log every auto-save entry so we can correlate isFresh state with timing.
+       This will reveal exactly when isFreshRef became false relative to mountLoad. */
+    try{
+      logSaveFailure('diag_autosave_enter','effect',
+        'jobs='+jobs.length+
+        ';isFresh='+isFreshRef.current+
+        ';dirty='+dirtyRef.current+
+        ';suppressNext='+suppressNextSaveRef.current+
+        ';online='+navigator.onLine
+      );
+    }catch(e){}
     /* If the most recent state change was from system code (mountLoad, dbLoad, etc),
        don't treat it as user input. Don't mark dirty, don't push to Supabase. */
     if(suppressNextSaveRef.current){
@@ -3872,6 +3897,8 @@ function App(){
        device's React state would otherwise auto-save and overwrite Supabase. */
     const VISIBILITY_REVALIDATE_MS=10*60*1000; /* 10 minutes */
     const onVis=()=>{
+      /* TELEMETRY v4.5.1: Log every visibility change so we can correlate with save blocks. */
+      try{logSaveFailure('diag_visibility','change','state='+document.visibilityState+';lastVis_ago_ms='+(Date.now()-lastVisibleRef.current));}catch(e){}
       if(document.visibilityState==='hidden'){
         lastVisibleRef.current=Date.now();
         flushNow();
@@ -3880,7 +3907,7 @@ function App(){
         if(hiddenFor>VISIBILITY_REVALIDATE_MS){
           /* Long hidden — invalidate freshness and force a fresh dbLoad */
           logSaveFailure('diag_visibility','revalidate_required','hidden_ms='+hiddenFor);
-          setFresh(false);
+          setFresh(false,'visibility_revalidate_invalidate');
           if(navigator.onLine){
             dbLoad().then(({jobs:j,farms:f,crew:c,fromCache})=>{
               if(dirtyRef.current)return;
@@ -3890,7 +3917,7 @@ function App(){
               suppressNextSaveRef.current=true;
               setJobs(migratedJobs);setFarmList(f);setCrewList(c);
               if(!fromCache){
-                setFresh(true);
+                setFresh(true,'visibility_revalidate_recovered');
                 logSaveFailure('diag_load','visibility_revalidate','fresh_after_revalidate');
               }
             }).catch(()=>{});
@@ -3902,9 +3929,23 @@ function App(){
     window.addEventListener('beforeunload',flushNow);
     window.addEventListener('pagehide',flushNow);
     document.addEventListener('visibilitychange',onVis);
+    /* TELEMETRY v4.5.1: pageshow fires on every page display, including BFCache restore.
+       BFCache restores skip the normal mount cycle entirely — refs and state survive,
+       but a long time may have passed. If event.persisted=true, this is a BFCache restore. */
+    const onPageShow=ev=>{
+      try{logSaveFailure('diag_pageshow','event','persisted='+(ev.persisted?'true':'false')+';isFresh='+isFreshRef.current+';isLoaded='+isLoaded.current);}catch(e){}
+    };
+    window.addEventListener('pageshow',onPageShow);
+    /* TELEMETRY v4.5.1: Also log pagehide separately so we can pair with pageshow. */
+    const onPageHide=ev=>{
+      try{logSaveFailure('diag_pagehide','event','persisted='+(ev.persisted?'true':'false')+';isFresh='+isFreshRef.current);}catch(e){}
+    };
+    window.addEventListener('pagehide',onPageHide);
     return()=>{
       window.removeEventListener('beforeunload',flushNow);
       window.removeEventListener('pagehide',flushNow);
+      window.removeEventListener('pagehide',onPageHide);
+      window.removeEventListener('pageshow',onPageShow);
       document.removeEventListener('visibilitychange',onVis);
     };
   },[]);
