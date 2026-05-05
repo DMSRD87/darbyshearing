@@ -523,8 +523,8 @@ const LS_LAST_RATES='mg_last_rates_'+CONTRACTOR_SLUG;
 const LS_ROLE_TS='mg_role_ts_'+CONTRACTOR_SLUG;
 const LS_DATA_VERSION='mg_data_version_'+CONTRACTOR_SLUG; /* tracks DATA_VERSION for one-time cache wipe */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.5.1'; /* Telemetry-only patch over v4.5.0. Adds detailed setFresh tracing and visibility/load event logging to find why iPhone sessions report fresh load then immediately block saves. NO functional changes — only diagnostic logging. */
-const DATA_VERSION='2026-05-02-cleanup'; /* Bump to force a one-time localStorage cache wipe on next boot. Used to clear stale state across all devices after a deploy that fixes data-corruption bugs. The wipe only happens if the offline queue is empty or successfully flushed first. */
+const APP_VERSION='v4.5.2'; /* BUG FIX over v4.5.1. iOS Safari Supabase JS client's .upsert() method occasionally returns a non-Promise value, causing .catch() chain to throw "is not a function". This was inside mountLoad and the throw bubbled to mountLoad.catch which set isFresh=false — the actual root cause of the multi-contractor wipe bug. Fix: wrapped deep-link logic in try/catch + Promise.resolve so any throw is contained and cannot poison the fresh state. */
+const DATA_VERSION='2026-05-05-iphone-fix'; /* Bump to force one-time localStorage cache wipe on next boot, ensuring all devices start clean with the iPhone bugfix in place. */
 
 const lsGet=k=>{try{return JSON.parse(localStorage.getItem(k)||'null');}catch{return null;}};
 const lsSet=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v));}catch(e){console.warn('localStorage full',e);}};
@@ -3633,25 +3633,46 @@ function App(){
         logSaveFailure('diag_load','mountLoad','stale_from_cache;jobs='+j.length+';online='+navigator.onLine);
       }
       setPendingCount((lsGet(LS_QUEUE)||[]).length);
-      /* Deep link: #job=JOB_ID&crew=CREW_ID opens that job on Overview tab and logs view */
-      const hash=window.location.hash;
-      const jobMatch=hash.match(/[#&]job=([^&]+)/);
-      const crewMatch=hash.match(/[#&]crew=([^&]+)/);
-      if(jobMatch){
-        const jid=jobMatch[1];
-        const cid=crewMatch?crewMatch[1]:null;
-        const found=j.find(x=>x.id===jid);
-        if(found){setSelJobId(jid);setScreen('job');setDeepLinkTab('overview');}
-        if(jid&&cid){
-          sb.from('job_views').upsert({
-            id:jid+'_'+cid,
-            contractor_slug:CONTRACTOR_SLUG,
-            job_id:jid,
-            crew_id:cid,
-            viewed_at:new Date().toISOString()
-          },{onConflict:'id'}).catch(()=>{});
+      /* Deep link: #job=JOB_ID&crew=CREW_ID opens that job on Overview tab and logs view.
+         FIX v4.5.2: Wrapped in try/catch because on iOS Safari, the Supabase client's
+         .upsert() method has been observed to return a non-Promise value in some code
+         paths, causing .catch() to throw "is not a function". That synchronous throw
+         used to poison mountLoad's .then() and silently flip isFresh back to false in
+         the .catch handler — which was the root cause of the multi-contractor data
+         wipe bug. Wrapping everything in try/catch ensures any error here can't escape
+         this block, and the deep-link logging is non-essential anyway. */
+      try{
+        const hash=window.location.hash;
+        const jobMatch=hash.match(/[#&]job=([^&]+)/);
+        const crewMatch=hash.match(/[#&]crew=([^&]+)/);
+        if(jobMatch){
+          const jid=jobMatch[1];
+          const cid=crewMatch?crewMatch[1]:null;
+          const found=j.find(x=>x.id===jid);
+          if(found){setSelJobId(jid);setScreen('job');setDeepLinkTab('overview');}
+          if(jid&&cid){
+            /* Wrap in Promise.resolve to handle the case where .upsert() returns
+               a non-thenable value on iOS Safari. The fire-and-forget chain still
+               works in Chrome where .upsert() returns a proper promise. */
+            try{
+              const upsertResult=sb.from('job_views').upsert({
+                id:jid+'_'+cid,
+                contractor_slug:CONTRACTOR_SLUG,
+                job_id:jid,
+                crew_id:cid,
+                viewed_at:new Date().toISOString()
+              },{onConflict:'id'});
+              Promise.resolve(upsertResult).catch(()=>{});
+            }catch(viewErr){
+              /* swallow — deep-link tracking is best-effort, never block app boot */
+              try{logSaveFailure('diag_load','job_views_swallowed','err='+(viewErr&&viewErr.message||'unknown'));}catch(e){}
+            }
+          }
+          window.location.hash='';
         }
-        window.location.hash='';
+      }catch(deepLinkErr){
+        /* Final safety net: deep-link processing must never break the app. */
+        try{logSaveFailure('diag_load','deeplink_swallowed','err='+(deepLinkErr&&deepLinkErr.message||'unknown'));}catch(e){}
       }
     }).catch(err=>{
       /* TELEMETRY v4.5.1: Capture WHY mountLoad's .then threw. Previously this catch had no log,
