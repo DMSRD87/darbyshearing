@@ -523,7 +523,7 @@ const LS_LAST_RATES='mg_last_rates_'+CONTRACTOR_SLUG;
 const LS_ROLE_TS='mg_role_ts_'+CONTRACTOR_SLUG;
 const LS_DATA_VERSION='mg_data_version_'+CONTRACTOR_SLUG; /* tracks DATA_VERSION for one-time cache wipe */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.5.2'; /* BUG FIX over v4.5.1. iOS Safari Supabase JS client's .upsert() method occasionally returns a non-Promise value, causing .catch() chain to throw "is not a function". This was inside mountLoad and the throw bubbled to mountLoad.catch which set isFresh=false — the actual root cause of the multi-contractor wipe bug. Fix: wrapped deep-link logic in try/catch + Promise.resolve so any throw is contained and cannot poison the fresh state. */
+const APP_VERSION='v4.5.3'; /* BUG FIX over v4.5.2. Date strip was frozen at daysAllocated, blocking tally entry once a shed ran over its planned days (Carriewerloo, Darby, day 8 of 10). jobDates() now extends past daysAllocated up to localToday() for Active jobs only, honoring includeWeekends. No data migration required — purely a display extension. v4.5.2 iOS Supabase upsert fix carried forward unchanged. */
 const DATA_VERSION='2026-05-05-iphone-fix'; /* Bump to force one-time localStorage cache wipe on next boot, ensuring all devices start clean with the iPhone bugfix in place. */
 
 const lsGet=k=>{try{return JSON.parse(localStorage.getItem(k)||'null');}catch{return null;}};
@@ -872,6 +872,26 @@ function jobDates(j){
       const dow=new Date(y,mo-1,dy).getDay();
       if(dow!==0&&dow!==6){ds.push(d);added++;}
       i++;
+    }
+  }
+  /* PATCH v4.5.3: Sheds run over allocated days. For Active jobs, extend the
+     date strip past daysAllocated up to today so tallies can still be entered.
+     Honors includeWeekends. Inactive jobs (Completed/Charged Out/Draft/
+     Dispatched) remain capped at daysAllocated. */
+  if((j.status||'Active')==='Active'){
+    const today=localToday();
+    let cursor=ds.length>0?ds[ds.length-1]:j.startDate;
+    let safety=0;
+    while(cursor<today&&safety<400){
+      cursor=addDays(cursor,1);
+      if(includeWeekends){
+        ds.push(cursor);
+      } else {
+        const [y,mo,dy]=cursor.split('-').map(Number);
+        const dow=new Date(y,mo-1,dy).getDay();
+        if(dow!==0&&dow!==6)ds.push(cursor);
+      }
+      safety++;
     }
   }
   return ds;
